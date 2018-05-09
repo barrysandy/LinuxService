@@ -1,0 +1,162 @@
+MySQL主从复制同步
+
+Replication原理
+**************************************************************
+**************************************************************
+Mysql 的 Replication 是一个异步的复制过程，从一个MySQL节点（称之为Master）复制到另一个MySQL节点（称之Slave）。在 Master 与 Slave 之间的实现整个复制过程主要由三个线程来完成，其中两个线程（SQL 线程和 I/O 线程）在 Slave 端，另外一个线程（I/O 线程）在 Master 端。
+
+要实现 MySQL 的 Replication ，首先必须打开 Master 端的 Binary Log，因为整个复制过程实际上就是 Slave 从Master 端获取该日志然后再在自己身上完全顺序的执行日志中所记录的各种操作。
+
+看上去MySQL的Replication原理非常简单，总结一下：
+
+每个从仅可以设置一个主。
+主在执行sql之后，记录二进制log文件（bin-log）。
+从连接主，并从主获取binlog，存于本地relay-log，并从上次记住的位置起执行sql，一旦遇到错误则停止同步。
+从这几条Replication原理来看，可以有这些推论：
+
+主从间的数据库不是实时同步，就算网络连接正常，也存在瞬间，主从数据不一致。
+如果主从的网络断开，从会在网络正常后，批量同步。
+如果对从进行修改数据，那么很可能从在执行主的bin-log时出现错误而停止同步，这个是很危险的操作。所以一般情况下，非常小心的修改从上的数据。
+一个衍生的配置是双主，互为主从配置，只要双方的修改不冲突，可以工作良好。
+如果需要多主的话，可以用环形配置，这样任意一个节点的修改都可以同步到所有节点。
+**************************************************************
+**************************************************************
+
+1.配置文件vim /etc/my.cnf
+*************************** set file *************************
+*************************** Master ***************************
+[mysqld]
+basedir=/usr/local/data/mysql
+datadir=/usr/local/data/mysql/data
+
+sql_mode=STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION
+
+#主从配置Master
+log-bin=mysql-bin #slave会基于此log-bin来做replication
+server-id=1 #master的标示
+innodb_flush_log_at_trx_commit=1
+sync_binlog=1
+
+replicate-do-db=test
+binlog-ignore-db=information_schema #表示，需要忽略哪些数据库
+binlog-ignore-db=mysql #表示，需要忽略哪些数据库
+binlog-ignore-db=performation_schema #表示，需要忽略哪些数据库
+binlog-ignore-db=sys #表示，需要忽略哪些数据库
+binlog-ignore-db=test2 #表示，需要忽略哪些数据库
+
+*************************** Slave ***************************
+[mysqld]
+basedir=/usr/local/data/mysql
+datadir=/usr/local/data/mysql/data
+
+sql_mode=STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION
+
+#主从配置 Salve1
+server-id=2 #slave的标示
+slave-skip-errors=all # mysql 复制可能出现主服务器上可以运行的语句，从服务器不能够运行
+relay-log=mysql-relay-bin # 该文件用于存放 Slave 端的 I/O 线程从 Master 端读取的二进制文件信息
+#关闭 binlog 主要考虑到我们使用 Master 的 binlog 进行增量备份，这里就不需要了。
+
+replicate-do-db=test
+binlog-ignore-db=information_schema #表示，需要忽略哪些数据库
+binlog-ignore-db=mysql #表示，需要忽略哪些数据库
+binlog-ignore-db=performation_schema #表示，需要忽略哪些数据库
+binlog-ignore-db=sys #表示，需要忽略哪些数据库
+binlog-ignore-db=test2 #表示，需要忽略哪些数据库
+
+
+2.Master授权
+*************************** sql set *************************
+Master(172.10.2.6)
+
+mysql> use mysql;
+Database changed
+
+mysql> select host,user from user;
++-----------+---------------+
+| host      | user          |
++-----------+---------------+
+| %         | root          |
+| localhost | mysql.session |
+| localhost | mysql.sys     |
+| localhost | root          |
++-----------+---------------+
+4 rows in set (0.01 sec)
+
+#授权slave
+mysql> grant replication slave,reload,super on *.* to slave@172.10.2.5 identified by 'slave';
+Query OK, 0 rows affected, 1 warning (0.01 sec)
+
+mysql> flush privilegens;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> show master status;
++------------------+----------+--------------+------------------+-------------------+
+| File             | Position | Binlog_Do_DB | Binlog_Ignore_DB | Executed_Gtid_Set |
++------------------+----------+--------------+------------------+-------------------+
+| mysql-bin.000001 |      624 |              |                  |                   |
++------------------+----------+--------------+------------------+-------------------+
+1 row in set (0.00 sec)
+
+Slave(172.10.2.5)
+
+mysql> start slave;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> show slave status\G;
+*************************** 1. row ***************************
+               Slave_IO_State: Connecting to master
+                  Master_Host: 172.10.2.6
+                  Master_User: slave
+                  Master_Port: 3306
+                Connect_Retry: 60
+              Master_Log_File: mysql-bin.000001
+          Read_Master_Log_Pos: 36884979
+               Relay_Log_File: DEV-SH-MAP-03-relay-bin.000001
+                Relay_Log_Pos: 4
+        Relay_Master_Log_File: mysql-bin.000001
+             Slave_IO_Running: Connecting
+            Slave_SQL_Running: Yes
+***************************************************************
+
+mysql> change master to master_host='172.10.2.6', master_user='root', master_password='xiaowu123456',master_log_file='mysql-bin.000001',master_log_pos=183;
+Query OK, 0 rows affected, 2 warnings (0.02 sec)
+        
+mysql> reset slave;
+Query OK, 0 rows affected (0.02 sec)
+mysql> start slave;
+Query OK, 0 rows affected (0.01 sec)
+mysql> show slave status\G;
+*************************** 1. row ***************************
+               Slave_IO_State: 
+                  Master_Host: 172.10.2.6
+                  Master_User: root
+                  Master_Port: 3306
+                Connect_Retry: 60
+              Master_Log_File: mysql-bin.000001
+          Read_Master_Log_Pos: 183
+               Relay_Log_File: mysql-relay-bin.000001
+                Relay_Log_Pos: 4
+        Relay_Master_Log_File: mysql-bin.000001
+             Slave_IO_Running: No
+            Slave_SQL_Running: No
+*************************************************************** 
+
+3.Master如果应用中使用了大的blog列或者字符串，那么在从服务器上恢复的时候就会出现‘log event exceeded max_allowed_packet’错误解决如下：
+*************************** sql set *************************
+show variables like 'max_allowed_packet';
+默认的是1M
+set @@global.max_allowed_packet=16777216;
+设置成16M
+
+4.切换主从服务器
+*************************** sql set *************************
+假设一台主服务器M，两个从服务器s1,s2！当主服务器出现故障的时候，需要将其中的而一个从数据库服务器(s1)切换成主服务器，同时修改另一个从服务器的配置，使之指向新的主服务器，还要通知应用修改主数据库的ip
+下面详细介绍切换主从数据库的步骤：
+在s1,s2上（从数据库服务器上）：
+首先：stop slave TO_THREAD；
+然后：show processlist \G
+     直到看到状态has read all relay log表示更新执行完毕
+在s1上，执行stop slave停止从服务，然后reset master
+在s2上，执行stop slave，然后change master to master_host='s1的ip',最后：start slave
+
